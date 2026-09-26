@@ -91,8 +91,12 @@
                   class="shrink-0 whitespace-nowrap rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-200 transition hover:border-emerald-500/60 hover:text-emerald-300 disabled:pointer-events-none disabled:opacity-40">
             ⬆️ Subir un nivel
           </button>
-          <input id="exp-ruta" type="text" spellcheck="false" autocomplete="off" title="Escribí una ruta y Enter para ir"
-                 class="min-w-0 flex-1 rounded-md border border-zinc-800 bg-zinc-950 px-2.5 py-1.5 font-mono text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20">
+          <div class="relative min-w-0 flex-1">
+            <input id="exp-ruta" type="text" spellcheck="false" autocomplete="off" title="Escribí una ruta y Enter para ir"
+                   class="w-full rounded-md border border-zinc-800 bg-zinc-950 py-1.5 pl-2.5 pr-8 font-mono text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20">
+            <button id="exp-copiar-ruta" type="button" title="Copiar ruta" aria-label="Copiar ruta"
+                    class="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 text-zinc-500 transition hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 data-[ok]:text-emerald-400"></button>
+          </div>
         </form>
         <p id="exp-error" class="hidden border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300"></p>
         <ul id="exp-lista" class="h-80 overflow-y-auto p-1 transition-opacity"></ul>
@@ -436,6 +440,43 @@
       return base.endsWith('\\') ? base + nombre : `${base}\\${nombre}`;
     }
 
+    const ICONO_COPIAR = '<svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+    const ICONO_COPIADO = '<svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+
+    async function copiarTexto(texto) {
+      try {
+        await navigator.clipboard.writeText(texto);
+      } catch {
+        // Método viejo con un textarea: para http://<ip-de-tailscale> (no es contexto seguro,
+        // navigator.clipboard no existe) o navegadores que niegan el permiso de portapapeles.
+        const area = document.createElement('textarea');
+        area.value = texto;
+        area.style.cssText = 'position:fixed;opacity:0';
+        document.body.append(area);
+        area.select();
+        const ok = document.execCommand('copy');
+        area.remove();
+        if (!ok) throw new Error('el navegador no lo permitió');
+      }
+    }
+
+    // Copia y muestra un ✓ en el mismo botón durante un momento.
+    async function copiarConAviso(boton, texto) {
+      try {
+        await copiarTexto(texto);
+      } catch (e) {
+        toast(`No se pudo copiar: ${e.message}`, 'error');
+        return;
+      }
+      boton.innerHTML = ICONO_COPIADO;
+      boton.setAttribute('data-ok', '');
+      clearTimeout(boton.temporizador);
+      boton.temporizador = setTimeout(() => {
+        boton.innerHTML = ICONO_COPIAR;
+        boton.removeAttribute('data-ok');
+      }, 1200);
+    }
+
     // El estado (currentPath) se actualiza recién cuando la PC remota confirma la ruta:
     // si falla (no existe, sin permisos) el explorador se queda donde estaba.
     async function explorar(ruta) {
@@ -474,33 +515,54 @@
         return;
       }
       expLista.replaceChildren(...items.map((item) => {
-        const boton = document.createElement('button');
-        boton.type = 'button';
-        boton.title = item.Name;
-        boton.dataset.nombre = item.Name;
-        if (item.IsFolder) boton.dataset.carpeta = '';
-        boton.className = 'flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm transition ' +
-          'hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 ' +
-          'data-[sel]:bg-emerald-500/15 data-[sel]:text-emerald-200 ' +
+        const fila = document.createElement('li');
+        fila.dataset.nombre = item.Name;
+        if (item.IsFolder) fila.dataset.carpeta = '';
+        fila.className = 'group flex items-center rounded-md transition hover:bg-zinc-800/80 data-[sel]:bg-emerald-500/15';
+
+        const principal = document.createElement('button');
+        principal.type = 'button';
+        principal.title = item.Name;
+        principal.className = 'flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm ' +
+          'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 group-data-[sel]:text-emerald-200 ' +
           (item.IsFolder ? 'text-zinc-100' : 'text-zinc-400');
-        boton.append(span(item.IsFolder ? '📁' : '📄', 'shrink-0'), span(item.Name, 'truncate'));
-        const li = document.createElement('li');
-        li.append(boton);
-        return li;
+        principal.append(span(item.IsFolder ? '📁' : '📄', 'shrink-0'), span(item.Name, 'truncate'));
+
+        const copiar = document.createElement('button');
+        copiar.type = 'button';
+        copiar.dataset.copiar = '';
+        copiar.title = 'Copiar ruta';
+        copiar.setAttribute('aria-label', `Copiar ruta de ${item.Name}`);
+        copiar.className = 'mr-1 shrink-0 rounded p-1.5 text-zinc-600 transition hover:bg-zinc-700/70 hover:text-zinc-100 ' +
+          'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 data-[ok]:text-emerald-400';
+        copiar.innerHTML = ICONO_COPIAR;
+
+        fila.append(principal, copiar);
+        return fila;
       }));
     }
 
     expLista.addEventListener('click', (e) => {
-      const boton = e.target.closest('button[data-nombre]');
-      if (!boton) return;
-      const ruta = unirRuta(currentPath, boton.dataset.nombre);
-      if ('carpeta' in boton.dataset) {
+      const boton = e.target.closest('button');
+      const fila = boton?.closest('li[data-nombre]');
+      if (!fila) return;
+      const ruta = unirRuta(currentPath, fila.dataset.nombre);
+      if ('copiar' in boton.dataset) {
+        copiarConAviso(boton, ruta);
+      } else if ('carpeta' in fila.dataset) {
         explorar(ruta);
       } else {
         expLista.querySelector('[data-sel]')?.removeAttribute('data-sel');
-        boton.setAttribute('data-sel', '');
+        fila.setAttribute('data-sel', '');
         lineaSistema(`📄 ${ruta}`);
       }
+    });
+
+    const expCopiarRuta = $('#exp-copiar-ruta');
+    expCopiarRuta.innerHTML = ICONO_COPIAR;
+    expCopiarRuta.addEventListener('click', () => {
+      const ruta = expRuta.value.trim();
+      if (ruta) copiarConAviso(expCopiarRuta, ruta);
     });
 
     expSubir.addEventListener('click', () => { if (padreActual) explorar(padreActual); });
