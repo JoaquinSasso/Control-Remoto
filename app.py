@@ -11,7 +11,9 @@ Uso:
         python app.py --abrir    -> lo abre solo cuando el server está listo
 """
 
+import base64
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +36,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 SSH_DESTINO = "joa@100.108.158.91"
 TIMEOUT_SEGUNDOS = 600  # compilaciones largas (gradle, etc.)
+# Vacío = carpeta de usuario de la cuenta SSH en la PC remota (%USERPROFILE%).
+# Ojo: `joa` tiene su perfil en C:\Users\nico_, no en C:\Users\joa.
+RUTA_INICIAL_EXPLORADOR = ""
+TIMEOUT_EXPLORAR = 30
 
 # Solo escucha en la propia notebook: cualquiera que alcance este puerto puede
 # ejecutar comandos en la PC remota. Si se cambia HOST para acceder desde otro
@@ -96,6 +102,10 @@ class Comando(BaseModel):
 
 class PedidoEjecucion(BaseModel):
     comando: TextoNoVacio
+
+
+class PedidoExplorar(BaseModel):
+    path: str | None = None
 
 
 # --- App ----------------------------------------------------------------------
@@ -183,8 +193,8 @@ def _decodificar(datos: bytes | None) -> str:
     return texto.replace("\r\n", "\n")
 
 
-@app.post("/api/ejecutar")
-def ejecutar(pedido: PedidoEjecucion):
+def _ssh(comando_remoto: str, timeout: int) -> tuple[bytes, bytes, int | None]:
+    """Corre `ssh destino <comando_remoto>` y devuelve (stdout, stderr, código). Código None = timeout."""
     ssh = shutil.which("ssh")
     if ssh is None:
         raise HTTPException(500, "No se encontró ssh en el PATH de esta máquina")
@@ -196,29 +206,88 @@ def ejecutar(pedido: PedidoEjecucion):
         "-o", "BatchMode=yes",      # nunca pedir contraseña: fallar en vez de colgarse
         "-o", "ConnectTimeout=10",
         SSH_DESTINO,
-        pedido.comando,
+        comando_remoto,
     ]
-
-    inicio = time.perf_counter()
     try:
-        proc = subprocess.run(
-            argumentos,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=TIMEOUT_SEGUNDOS,
-        )
-        stdout, stderr, codigo, timeout = proc.stdout, proc.stderr, proc.returncode, False
+        proc = subprocess.run(argumentos, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        return proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:
-        stdout, stderr, codigo, timeout = exc.stdout, exc.stderr, None, True
+        return exc.stdout or b"", exc.stderr or b"", None
 
+
+@app.post("/api/ejecutar")
+def ejecutar(pedido: PedidoEjecucion):
+    inicio = time.perf_counter()
+    stdout, stderr, codigo = _ssh(pedido.comando, TIMEOUT_SEGUNDOS)
     return {
         "comando": pedido.comando,
         "stdout": _decodificar(stdout),
         "stderr": _decodificar(stderr),
         "codigo_salida": codigo,
-        "timeout": timeout,
+        "timeout": codigo is None,
         "duracion_ms": round((time.perf_counter() - inicio) * 1000),
     }
+
+
+# --- Explorador de archivos ---------------------------------------------------
+
+# Es el pipeline `Get-ChildItem | Select-Object Name, IsFolder | ConvertTo-Json`,
+# con los arreglos que necesita para no romperse con rutas reales:
+#  - Viaja como -EncodedCommand y la ruta, en base64: el cmd.exe remoto no
+#    interpreta nada (% ^ & ") y un nombre con ' o ’ no corta el string.
+#  - -LiteralPath: los corchetes [ ] de un nombre no se toman como comodines.
+#  - @(...) en -InputObject: siempre es un array, aunque haya 1 elemento o ninguno.
+#  - Lo no-ASCII sale como \uXXXX: no depende de la code page de la consola remota.
+#  - Los errores también salen como JSON por stdout, con el mensaje de Windows.
+_SCRIPT_EXPLORAR = r"""
+$ProgressPreference = 'SilentlyContinue'
+$ruta = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RUTA_B64__'))
+if (-not $ruta) { $ruta = $env:USERPROFILE }
+try {
+    $dir = Get-Item -LiteralPath $ruta -Force -ErrorAction Stop
+    if ($dir -isnot [IO.DirectoryInfo]) { throw "No es una carpeta: $ruta" }
+    $items = @(Get-ChildItem -LiteralPath $dir.FullName -ErrorAction Stop |
+        Select-Object Name, @{Name='IsFolder';Expression={$_.PSIsContainer}})
+    $padre = if ($dir.Parent) { $dir.Parent.FullName } else { $null }
+    $r = @{ ok = $true; path = $dir.FullName; padre = $padre; items = $items }
+} catch [Management.Automation.ItemNotFoundException] {
+    $r = @{ ok = $false; no_existe = $true; error = $_.Exception.Message }
+} catch {
+    $r = @{ ok = $false; no_existe = $false; error = $_.Exception.Message }
+}
+$json = ConvertTo-Json -InputObject $r -Depth 4 -Compress
+[regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+"""
+
+
+def _comando_explorar(ruta: str) -> str:
+    ruta_b64 = base64.b64encode(ruta.encode("utf-8")).decode("ascii")
+    script = _SCRIPT_EXPLORAR.replace("__RUTA_B64__", ruta_b64)
+    script_b64 = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell -NoProfile -NonInteractive -EncodedCommand {script_b64}"
+
+
+@app.post("/api/explorar")
+def explorar(pedido: PedidoExplorar):
+    ruta = (pedido.path or "").strip() or RUTA_INICIAL_EXPLORADOR
+    if re.fullmatch(r"[A-Za-z]:", ruta):  # "C:" a secas sería el directorio actual de C:
+        ruta += "\\"
+
+    stdout, stderr, codigo = _ssh(_comando_explorar(ruta), TIMEOUT_EXPLORAR)
+    if codigo is None:
+        raise HTTPException(504, f"La PC remota no respondió en {TIMEOUT_EXPLORAR} s")
+    try:
+        r = json.loads(stdout)
+    except ValueError:
+        # Sin JSON: falló ssh (red, clave, host key) o PowerShell no llegó a correr.
+        detalle = _decodificar(stderr).strip() or f"Respuesta inválida de la PC remota (código {codigo})"
+        raise HTTPException(502, detalle)
+
+    if not r["ok"]:
+        raise HTTPException(404 if r["no_existe"] else 400, r["error"])
+    path = r["path"] if len(r["path"]) <= 3 else r["path"].rstrip("\\")  # "C:\" conserva su barra
+    items = sorted(r["items"], key=lambda i: (not i["IsFolder"], i["Name"].casefold()))
+    return {"path": path, "padre": r["padre"], "items": items}
 
 
 # --- Arranque -----------------------------------------------------------------
