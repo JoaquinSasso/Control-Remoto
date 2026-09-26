@@ -95,7 +95,7 @@
             <input id="exp-ruta" type="text" spellcheck="false" autocomplete="off" title="Escribí una ruta y Enter para ir"
                    class="w-full rounded-md border border-zinc-800 bg-zinc-950 py-1.5 pl-2.5 pr-8 font-mono text-xs text-zinc-200 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20">
             <button id="exp-copiar-ruta" type="button" title="Copiar ruta" aria-label="Copiar ruta"
-                    class="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 text-zinc-500 transition hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 data-[ok]:text-emerald-400"></button>
+                    class="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 text-zinc-500 transition hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:pointer-events-none disabled:opacity-30 data-[ok]:text-emerald-400"></button>
           </div>
         </form>
         <p id="exp-error" class="hidden border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300"></p>
@@ -429,15 +429,30 @@
 
     let currentPath = '';   // '' hasta la primera carga: el backend abre la carpeta de usuario remota
     let padreActual = null;
+    let enDiscos = false;   // vista "Este equipo": la lista de unidades, un nivel arriba de C:\
     let ultimoPedido = 0;   // descarta respuestas viejas si se navega rápido
 
     const expLista = $('#exp-lista');
     const expRuta = $('#exp-ruta');
     const expSubir = $('#exp-subir');
     const expError = $('#exp-error');
+    const expCopiarRuta = $('#exp-copiar-ruta');
 
-    function unirRuta(base, nombre) {
-      return base.endsWith('\\') ? base + nombre : `${base}\\${nombre}`;
+    // En la vista de unidades cada nombre ("C:\") ya es una ruta completa.
+    function rutaDe(nombre) {
+      if (enDiscos) return nombre;
+      return currentPath.endsWith('\\') ? currentPath + nombre : `${currentPath}\\${nombre}`;
+    }
+
+    function formatearBytes(bytes) {
+      const gb = bytes / 1024 ** 3;
+      return gb >= 1000 ? `${(gb / 1024).toFixed(1)} TB` : `${Math.round(gb)} GB`;
+    }
+
+    function detalleDisco(disco) {
+      if (!disco.Listo) return 'no disponible';
+      return [disco.Etiqueta, `${formatearBytes(disco.Libre)} libres de ${formatearBytes(disco.Total)}`]
+        .filter(Boolean).join(' · ');
     }
 
     const ICONO_COPIAR = '<svg class="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
@@ -488,6 +503,7 @@
         if (pedido !== ultimoPedido) return;
         currentPath = r.path;
         padreActual = r.padre;
+        enDiscos = r.discos;
         expError.classList.add('hidden');
         renderExplorador(r.items);
       } catch (e) {
@@ -500,6 +516,7 @@
           $('#exp-cargando').classList.add('hidden');
           expRuta.value = currentPath;
           expSubir.disabled = !padreActual;
+          expCopiarRuta.disabled = enDiscos;  // "Este equipo" no es una ruta
         }
       }
     }
@@ -526,7 +543,12 @@
         principal.className = 'flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm ' +
           'focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 group-data-[sel]:text-emerald-200 ' +
           (item.IsFolder ? 'text-zinc-100' : 'text-zinc-400');
-        principal.append(span(item.IsFolder ? '📁' : '📄', 'shrink-0'), span(item.Name, 'truncate'));
+        if (enDiscos) {
+          principal.append(span('💽', 'shrink-0'), span(item.Name, 'shrink-0'),
+            span(detalleDisco(item), 'truncate text-xs text-zinc-500'));
+        } else {
+          principal.append(span(item.IsFolder ? '📁' : '📄', 'shrink-0'), span(item.Name, 'truncate'));
+        }
 
         const copiar = document.createElement('button');
         copiar.type = 'button';
@@ -546,7 +568,7 @@
       const boton = e.target.closest('button');
       const fila = boton?.closest('li[data-nombre]');
       if (!fila) return;
-      const ruta = unirRuta(currentPath, fila.dataset.nombre);
+      const ruta = rutaDe(fila.dataset.nombre);
       if ('copiar' in boton.dataset) {
         copiarConAviso(boton, ruta);
       } else if ('carpeta' in fila.dataset) {
@@ -558,7 +580,6 @@
       }
     });
 
-    const expCopiarRuta = $('#exp-copiar-ruta');
     expCopiarRuta.innerHTML = ICONO_COPIAR;
     expCopiarRuta.addEventListener('click', () => {
       const ruta = expRuta.value.trim();

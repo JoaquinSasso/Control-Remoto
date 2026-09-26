@@ -239,8 +239,14 @@ def ejecutar(pedido: PedidoEjecucion):
 #  - @(...) en -InputObject: siempre es un array, aunque haya 1 elemento o ninguno.
 #  - Lo no-ASCII sale como \uXXXX: no depende de la code page de la consola remota.
 #  - Los errores también salen como JSON por stdout, con el mensaje de Windows.
-_SCRIPT_EXPLORAR = r"""
-$ProgressPreference = 'SilentlyContinue'
+# Cada script deja su resultado en $r; el inicio y el fin son comunes.
+_PS_INICIO = "$ProgressPreference = 'SilentlyContinue'\n"
+_PS_FIN = r"""
+$json = ConvertTo-Json -InputObject $r -Depth 4 -Compress
+[regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+"""
+
+_SCRIPT_CARPETA = r"""
 $ruta = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RUTA_B64__'))
 if (-not $ruta) { $ruta = $env:USERPROFILE }
 try {
@@ -255,39 +261,61 @@ try {
 } catch {
     $r = @{ ok = $false; no_existe = $false; error = $_.Exception.Message }
 }
-$json = ConvertTo-Json -InputObject $r -Depth 4 -Compress
-[regex]::Replace($json, '[^\x00-\x7F]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
 """
 
+# DriveInfo en vez de Get-PSDrive: trae tipo, etiqueta y espacio, y es instantáneo.
+# Una unidad sin medio (lector de tarjetas vacío, DVD sin disco) sale con Listo = false.
+_SCRIPT_DISCOS = r"""
+$discos = foreach ($d in [IO.DriveInfo]::GetDrives()) {
+    $item = [ordered]@{ Name = $d.Name; IsFolder = $true; Listo = $d.IsReady }
+    if ($d.IsReady) {
+        try { $item.Etiqueta = $d.VolumeLabel; $item.Libre = $d.AvailableFreeSpace; $item.Total = $d.TotalSize }
+        catch { $item.Listo = $false }
+    }
+    [pscustomobject]$item
+}
+$r = @{ ok = $true; items = @($discos) }
+"""
 
-def _comando_explorar(ruta: str) -> str:
-    ruta_b64 = base64.b64encode(ruta.encode("utf-8")).decode("ascii")
-    script = _SCRIPT_EXPLORAR.replace("__RUTA_B64__", ruta_b64)
-    script_b64 = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    return f"powershell -NoProfile -NonInteractive -EncodedCommand {script_b64}"
+# Lo que hay "arriba" de la raíz de un disco: la lista de unidades, como en Windows.
+ESTE_EQUIPO = "Este equipo"
 
 
-@app.post("/api/explorar")
-def explorar(pedido: PedidoExplorar):
-    ruta = (pedido.path or "").strip() or RUTA_INICIAL_EXPLORADOR
-    if re.fullmatch(r"[A-Za-z]:", ruta):  # "C:" a secas sería el directorio actual de C:
-        ruta += "\\"
-
-    stdout, stderr, codigo = _ssh(_comando_explorar(ruta), TIMEOUT_EXPLORAR)
+def _powershell(script: str) -> dict:
+    """Corre un script en la PowerShell remota y devuelve el JSON que deja en $r."""
+    script_b64 = base64.b64encode((_PS_INICIO + script + _PS_FIN).encode("utf-16-le")).decode("ascii")
+    stdout, stderr, codigo = _ssh(f"powershell -NoProfile -NonInteractive -EncodedCommand {script_b64}", TIMEOUT_EXPLORAR)
     if codigo is None:
         raise HTTPException(504, f"La PC remota no respondió en {TIMEOUT_EXPLORAR} s")
     try:
-        r = json.loads(stdout)
+        return json.loads(stdout)
     except ValueError:
         # Sin JSON: falló ssh (red, clave, host key) o PowerShell no llegó a correr.
         detalle = _decodificar(stderr).strip() or f"Respuesta inválida de la PC remota (código {codigo})"
         raise HTTPException(502, detalle)
 
+
+@app.post("/api/explorar")
+def explorar(pedido: PedidoExplorar):
+    ruta = (pedido.path or "").strip() or RUTA_INICIAL_EXPLORADOR
+
+    if ruta.casefold() == ESTE_EQUIPO.casefold():
+        discos = sorted(_powershell(_SCRIPT_DISCOS)["items"], key=lambda d: d["Name"])
+        return {"path": ESTE_EQUIPO, "padre": None, "discos": True, "items": discos}
+
+    if re.fullmatch(r"[A-Za-z]:", ruta):  # "C:" a secas sería el directorio actual de C:
+        ruta += "\\"
+    ruta_b64 = base64.b64encode(ruta.encode("utf-8")).decode("ascii")
+    r = _powershell(_SCRIPT_CARPETA.replace("__RUTA_B64__", ruta_b64))
+
     if not r["ok"]:
         raise HTTPException(404 if r["no_existe"] else 400, r["error"])
     path = r["path"] if len(r["path"]) <= 3 else r["path"].rstrip("\\")  # "C:\" conserva su barra
+    padre = r["padre"]
+    if padre is None and re.fullmatch(r"[A-Za-z]:\\", path):
+        padre = ESTE_EQUIPO  # desde la raíz de un disco se sube a la lista de unidades
     items = sorted(r["items"], key=lambda i: (not i["IsFolder"], i["Name"].casefold()))
-    return {"path": path, "padre": r["padre"], "items": items}
+    return {"path": path, "padre": padre, "discos": False, "items": items}
 
 
 # --- Arranque -----------------------------------------------------------------
