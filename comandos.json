@@ -1,0 +1,18 @@
+{
+  "hostname": {
+    "nombre": "Hostname",
+    "comando_ssh": "hostname"
+  },
+  "whoami": {
+    "nombre": "Usuario actual",
+    "comando_ssh": "whoami"
+  },
+  "procesos-python": {
+    "nombre": "Procesos Python",
+    "comando_ssh": "tasklist /FI \"IMAGENAME eq python.exe\""
+  },
+  "discos": {
+    "nombre": "Espacio en disco",
+    "comando_ssh": "powershell -NoProfile -Command \"Get-PSDrive -PSProvider FileSystem\""
+  }
+}
