@@ -13,6 +13,7 @@ Uso:
 
 import base64
 import json
+import queue
 import re
 import shutil
 import subprocess
@@ -36,6 +37,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 SSH_DESTINO = "joa@100.108.158.91"
 TIMEOUT_SEGUNDOS = 600  # compilaciones largas (gradle, etc.)
+# Code page OEM de la PC remota (Windows en español = 850). cmd.exe lee los
+# comandos por stdin en esta code page: con UTF-8 (chcp 65001) rompe las tildes.
+CODEPAGE_REMOTA = "cp850"
 # Vacío = carpeta de usuario de la cuenta SSH en la PC remota (%USERPROFILE%).
 # Ojo: `joa` tiene su perfil en C:\Users\nico_, no en C:\Users\joa.
 RUTA_INICIAL_EXPLORADOR = ""
@@ -179,54 +183,264 @@ def eliminar_comando(id_: str):
 
 def _decodificar(datos: bytes | None) -> str:
     """
-    ssh.exe reenvía los bytes tal cual los produce la PC remota. cmd.exe en un
-    Windows en español escribe en la code page OEM (cp850), salvo que se haya
-    hecho `chcp 65001` o el programa emita UTF-8 por su cuenta. Se intenta UTF-8
-    estricto primero y, si falla, cp850 (que acepta cualquier byte).
+    ssh.exe reenvía los bytes tal cual los produce la PC remota. cmd.exe escribe
+    en la code page OEM (CODEPAGE_REMOTA), pero hay programas que emiten UTF-8
+    por su cuenta. Se intenta UTF-8 estricto primero y, si falla, la code page
+    OEM (que acepta cualquier byte).
     """
     if not datos:
         return ""
     try:
         texto = datos.decode("utf-8-sig")
     except UnicodeDecodeError:
-        texto = datos.decode("cp850", errors="replace")
+        texto = datos.decode(CODEPAGE_REMOTA, errors="replace")
     return texto.replace("\r\n", "\n")
 
 
-def _ssh(comando_remoto: str, timeout: int) -> tuple[bytes, bytes, int | None]:
-    """Corre `ssh destino <comando_remoto>` y devuelve (stdout, stderr, código). Código None = timeout."""
+def _argumentos_ssh(comando_remoto: str) -> list[str]:
     ssh = shutil.which("ssh")
     if ssh is None:
         raise HTTPException(500, "No se encontró ssh en el PATH de esta máquina")
-
     # Lista de argumentos sin shell=True: así `&&`, `|`, etc. los interpreta el
     # cmd.exe remoto y no el de la notebook.
-    argumentos = [
+    return [
         ssh,
-        "-o", "BatchMode=yes",      # nunca pedir contraseña: fallar en vez de colgarse
+        "-T",                               # sin terminal: la E/S va por pipes
+        "-o", "BatchMode=yes",              # nunca pedir contraseña: fallar en vez de colgarse
         "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=30",     # detecta conexiones muertas (p. ej. si se cae Tailscale)
         SSH_DESTINO,
         comando_remoto,
     ]
+
+
+def _ssh(comando_remoto: str, timeout: int) -> tuple[bytes, bytes, int | None]:
+    """Conexión de un solo uso (la usa el explorador). Devuelve (stdout, stderr, código); código None = timeout."""
     try:
-        proc = subprocess.run(argumentos, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        proc = subprocess.run(
+            _argumentos_ssh(comando_remoto), stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout
+        )
         return proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired as exc:
         return exc.stdout or b"", exc.stderr or b"", None
 
 
+class ErrorSesion(Exception):
+    """No se pudo abrir la sesión SSH (red, clave, host key...)."""
+
+
+def _leer_flujo(flujo, cola: queue.Queue) -> None:
+    for bloque in iter(lambda: flujo.read1(65536), b""):
+        cola.put(bloque)
+    cola.put(None)  # EOF: la sesión terminó
+
+
+def _con_cd_d(linea: str) -> str:
+    # En cmd, `cd D:\x` cambia el directorio de D: pero no pasa a esa unidad; con /d sí.
+    return re.sub(r"^(\s*(?:cd|chdir))\s+(?!/)", r"\1 /d ", linea, count=1, flags=re.IGNORECASE)
+
+
+class SesionSSH:
+    """
+    Una única conexión `ssh destino cmd` que queda abierta: el cmd.exe remoto
+    conserva el directorio (cd), las variables (set), etc. entre comandos.
+
+    Protocolo: cada comando entra por stdin dentro de un bloque `( ... ) <nul`
+    (así `pause`, `set /p` o un input() reciben EOF en vez de comerse las líneas
+    siguientes) y detrás va una línea que imprime un marcador único con el
+    errorlevel y el %cd% en stdout, y el marcador solo en stderr. Todo lo que
+    llega antes de los marcadores es la salida del comando.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()  # un comando a la vez, como en una consola
+        self._proc: subprocess.Popen | None = None
+        self._colas: dict[str, queue.Queue] = {}
+        self._buffers: dict[str, bytearray] = {}
+        self._prompt_mas = b""  # "¿Más? ": cmd lo imprime por cada línea de continuación de un bloque
+        self._hubo_sesion = False
+        self.cwd: str | None = None  # último directorio conocido; se restaura al reconectar
+
+    def _viva(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def _cerrar(self) -> None:
+        if self._viva():
+            self._proc.kill()  # el cmd remoto muere con la conexión
+        self._proc = None
+
+    def _esperar(self, flujo: str, patron: re.Pattern, limite: float) -> tuple[bytes, tuple, str]:
+        """Lee `flujo` hasta que aparece `patron`. Devuelve (lo anterior, grupos del match, estado)."""
+        buf, cola = self._buffers[flujo], self._colas[flujo]
+        while True:
+            if m := patron.search(buf):
+                # Copiar antes de recortar: el match apunta al mismo bytearray.
+                antes, grupos = bytes(buf[:m.start()]), tuple(bytes(g) for g in m.groups())
+                del buf[:m.end()]
+                return antes, grupos, "ok"
+            try:
+                bloque = cola.get(timeout=max(0.0, limite - time.monotonic()))
+            except queue.Empty:
+                return bytes(buf), (), "timeout"
+            if bloque is None:
+                return bytes(buf), (), "cerrada"
+            buf += bloque
+
+    def _resto(self, flujo: str, segundos: float) -> bytes:
+        """Todo lo que llegue por `flujo` hasta su EOF o hasta `segundos` (p. ej. el error de ssh al cortarse)."""
+        buf, cola = self._buffers[flujo], self._colas[flujo]
+        limite = time.monotonic() + segundos
+        while True:
+            try:
+                bloque = cola.get(timeout=max(0.0, limite - time.monotonic()))
+            except queue.Empty:
+                break
+            if bloque is None:
+                break
+            buf += bloque
+        return bytes(buf)
+
+    def _enviar(self, lineas: str, limite: float) -> tuple[bytes, bytes, int | None, str | None, str]:
+        """Manda líneas al cmd remoto y espera el marcador. Devuelve (stdout, stderr, errorlevel, cwd, estado)."""
+        marca = f"__FIN_{uuid.uuid4().hex}__"
+        # "@": que no se repita en pantalla aunque el usuario haya hecho `echo on`.
+        texto = lineas + f"@echo {marca} %errorlevel% %cd%& echo {marca} 1>&2\r\n"
+        try:
+            self._proc.stdin.write(texto.encode(CODEPAGE_REMOTA, errors="replace"))
+            self._proc.stdin.flush()
+        except OSError:
+            return b"", self._resto("err", 2), None, None, "cerrada"
+
+        # El errorlevel tiene que ser un número: si el usuario hizo `echo on`, cmd repite la
+        # línea tal cual la recibe ("%errorlevel%" sin expandir) y eso no debe tomarse como el final.
+        marca_b = re.escape(marca.encode())
+        stdout, grupos, estado = self._esperar("out", re.compile(marca_b + rb" (-?\d+) ([^\r\n]*)\r\n"), limite)
+        if estado == "ok":
+            stderr, _, estado = self._esperar("err", re.compile(marca_b + rb"[^\r\n]*\r\n"), limite)
+        else:
+            stderr = self._resto("err", 2 if estado == "cerrada" else 0)
+        if estado != "ok":
+            return stdout, stderr, None, None, estado
+        codigo, cwd = grupos
+        return stdout, stderr, int(codigo), cwd.decode(CODEPAGE_REMOTA).strip(), "ok"
+
+    def _iniciar(self) -> None:
+        # /q: que cmd no repita cada línea que lee por stdin. /d: sin AutoRun del registro.
+        self._proc = subprocess.Popen(
+            _argumentos_ssh("cmd /d /q"), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self._colas = {"out": queue.Queue(), "err": queue.Queue()}
+        self._buffers = {"out": bytearray(), "err": bytearray()}
+        for nombre, flujo in (("out", self._proc.stdout), ("err", self._proc.stderr)):
+            threading.Thread(target=_leer_flujo, args=(flujo, self._colas[nombre]), daemon=True).start()
+
+        # Sin eco no hay prompt (el /q solo no alcanza con stdin por pipe). Se
+        # descarta el banner de Windows y se vuelve al último directorio conocido.
+        inicio = "@echo off\r\n" + (f'cd /d "{self.cwd}" 2>nul\r\n' if self.cwd else "")
+        _, stderr, _, cwd, estado = self._enviar(inicio, time.monotonic() + 20)
+        if estado != "ok":
+            self._cerrar()
+            if estado == "timeout":
+                raise ErrorSesion("La PC remota no respondió al abrir la sesión SSH")
+            raise ErrorSesion(_decodificar(stderr).strip() or "No se pudo abrir la sesión SSH")
+        self.cwd = cwd
+
+        # Un bloque con una línea de continuación: lo que imprime es el prompt "¿Más? " de este Windows.
+        mas, _, _, _, estado = self._enviar("(cd .\r\n) <nul\r\n", time.monotonic() + 10)
+        self._prompt_mas = mas if estado == "ok" else b""
+        self._hubo_sesion = True
+
+    def estado(self) -> str | None:
+        """Directorio actual; abre la sesión si hace falta."""
+        if self._viva():  # sin lock: puede haber un comando largo corriendo
+            return self.cwd
+        with self._lock:
+            if not self._viva():
+                self._iniciar()
+            return self.cwd
+
+    def reiniciar(self) -> str | None:
+        """Corta la sesión (y el comando en curso, si hay uno) y abre una nueva en la carpeta de usuario."""
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        with self._lock:
+            self._cerrar()
+            self.cwd = None
+            self._iniciar()
+            return self.cwd
+
+    def ejecutar(self, comando: str, timeout: float) -> dict:
+        with self._lock:
+            aviso = None
+            if not self._viva():
+                reconexion = self._hubo_sesion
+                self._iniciar()
+                if reconexion:
+                    aviso = "Se abrió una nueva conexión SSH: se conservó el directorio, no las variables de entorno."
+
+            cwd_inicial = self.cwd
+            lineas = [_con_cd_d(l) for l in comando.replace("\r\n", "\n").split("\n") if l.strip()]
+            # (call ) pone errorlevel en 0: si no, un `set` "hereda" el error del comando anterior.
+            bloque = "@(call )\r\n(" + "\r\n".join(lineas) + "\r\n) <nul\r\n"
+            inicio = time.perf_counter()
+            stdout, stderr, codigo, cwd, estado = self._enviar(bloque, time.monotonic() + timeout)
+
+            # Quitar los "¿Más? " (uno por línea de continuación) que cmd imprime antes de la salida.
+            for _ in range(len(lineas)):
+                if not self._prompt_mas or not stdout.startswith(self._prompt_mas):
+                    break
+                stdout = stdout[len(self._prompt_mas):]
+
+            if estado == "ok":
+                self.cwd = cwd
+            else:
+                self._cerrar()
+                if estado == "cerrada":
+                    aviso = "La sesión SSH terminó (exit o se cortó la conexión). El próximo comando abre una nueva."
+
+            return {
+                "comando": comando,
+                "stdout": _decodificar(stdout),
+                "stderr": _decodificar(stderr),
+                "codigo_salida": codigo,
+                "timeout": estado == "timeout",
+                "duracion_ms": round((time.perf_counter() - inicio) * 1000),
+                "cwd_inicial": cwd_inicial,
+                "cwd": self.cwd,
+                "aviso": aviso,
+            }
+
+
+sesion = SesionSSH()
+
+
 @app.post("/api/ejecutar")
 def ejecutar(pedido: PedidoEjecucion):
-    inicio = time.perf_counter()
-    stdout, stderr, codigo = _ssh(pedido.comando, TIMEOUT_SEGUNDOS)
-    return {
-        "comando": pedido.comando,
-        "stdout": _decodificar(stdout),
-        "stderr": _decodificar(stderr),
-        "codigo_salida": codigo,
-        "timeout": codigo is None,
-        "duracion_ms": round((time.perf_counter() - inicio) * 1000),
-    }
+    try:
+        pedido.comando.encode(CODEPAGE_REMOTA)
+    except UnicodeEncodeError as e:
+        raise HTTPException(400, f"cmd.exe no puede recibir el carácter {e.object[e.start]!r} (code page {CODEPAGE_REMOTA})")
+    try:
+        return sesion.ejecutar(pedido.comando, TIMEOUT_SEGUNDOS)
+    except ErrorSesion as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/api/sesion")
+def estado_sesion():
+    try:
+        return {"cwd": sesion.estado()}
+    except ErrorSesion as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/sesion/reiniciar")
+def reiniciar_sesion():
+    try:
+        return {"cwd": sesion.reiniciar()}
+    except ErrorSesion as e:
+        raise HTTPException(502, str(e))
 
 
 # --- Explorador de archivos ---------------------------------------------------
